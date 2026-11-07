@@ -163,6 +163,19 @@ def container_identity_map(
     return identities
 
 
+def container_identity_segments(
+    coordinator: BeszelDataUpdateCoordinator,
+) -> set[str]:
+    """Return every container identity segment that may still own entities.
+
+    The current identities, plus the runtime container ID segments that are being
+    migrated onto them.
+    """
+    segments = {f"container:{identity}" for identity in coordinator.containers}
+    segments.update(container_identity_map(coordinator))
+    return segments
+
+
 @callback
 def async_migrate_legacy_entities(
     hass: HomeAssistant,
@@ -345,29 +358,86 @@ def async_migrate_legacy_entities(
 @callback
 def async_migrate_container_devices(
     hass: HomeAssistant,
+    entry: ConfigEntry,
     coordinator: BeszelDataUpdateCoordinator,
 ) -> None:
     """Re-point container devices at their stable identity.
 
-    Registering the identity as a new identifier would otherwise create a second
-    device and drop the first one's area, name and labels.
+    The device is reached through the entity that already lives on it. Its stored
+    identifier holds the runtime container ID the Hub reported when the device was
+    created, which every later recreate replaces, so looking the device up by that
+    ID misses every container that has been replaced since. Registering the
+    identity as a new identifier instead would create a second device and drop the
+    first one's area, name and labels.
     """
+    entity_registry = er.async_get(hass)
     device_registry = dr.async_get(hass)
     identities = container_identity_map(coordinator)
     if not identities:
         return
-    for identity, container in coordinator.containers.items():
-        record_id = container.get("id")
-        if not isinstance(record_id, str) or not record_id or record_id == identity:
+
+    # Entity unique IDs were just migrated, so the prefix identifies the container.
+    wanted: dict[str, str] = {}
+    for segment in identities.values():
+        identity = segment.partition(":")[2]
+        wanted[f"{coordinator.namespace}:container:{identity}"] = identity
+    taken = {
+        identifier
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        for identifier in device.identifiers
+    }
+
+    for registry_entry in list(entity_registry.entities.values()):
+        if registry_entry.config_entry_id != entry.entry_id:
             continue
-        previous = device_identifier(coordinator, "container", record_id)
+        if not registry_entry.unique_id or not registry_entry.device_id:
+            continue
+        prefix, separator, _ = registry_entry.unique_id.rpartition(":")
+        identity = wanted.get(prefix) if separator else None
+        if identity is None:
+            continue
         stable = device_identifier(coordinator, "container", identity)
-        device = device_registry.async_get_device(identifiers={previous})
-        if device is None:
+        if stable in taken:
             continue
-        if device_registry.async_get_device(identifiers={stable}) is not None:
+        device = device_registry.async_get(registry_entry.device_id)
+        if device is None or device.identifiers == {stable}:
             continue
         device_registry.async_update_device(device.id, new_identifiers={stable})
+        taken.add(stable)
+
+
+@callback
+def async_remove_stale_container_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: BeszelDataUpdateCoordinator,
+) -> None:
+    """Remove container entities whose identity no longer exists.
+
+    The platform managers only retire entities they created themselves, so an
+    entity left behind by an earlier container identity - for example one keyed on
+    a runtime container ID that has since been replaced - would stay unavailable
+    for good and keep its long-term statistics stranded. Skipped when the Hub
+    reports no containers, so a failed poll can never mass-remove entities.
+    """
+    if not coordinator.containers:
+        return
+    registry = er.async_get(hass)
+    known = container_identity_segments(coordinator)
+    stale_devices: set[str] = set()
+    for entity in list(registry.entities.values()):
+        if entity.config_entry_id != entry.entry_id or not entity.unique_id:
+            continue
+        namespace, separator, suffix = entity.unique_id.partition(":")
+        if not separator or namespace != coordinator.namespace:
+            continue
+        segment, inner, _ = suffix.rpartition(":")
+        if not inner or not segment.startswith("container:") or segment in known:
+            continue
+        stale_devices.add(segment.partition(":")[2])
+        registry.async_remove(entity.entity_id)
+    for identity in stale_devices:
+        async_remove_device_if_empty(hass, coordinator, "container", identity)
 
 
 @callback
