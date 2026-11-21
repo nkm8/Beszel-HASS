@@ -129,6 +129,11 @@ def container_identity(system_id: str, name: str) -> str:
     return f"container-{_identity_digest(system_id, name)}"
 
 
+def _container_rank(container: dict[str, Any]) -> tuple[bool, str]:
+    """Rank duplicate records for one container name: running, then freshest."""
+    return (bool(container.get("running")), str(container.get("updated") or ""))
+
+
 def normalize_extra_filesystems(stats: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Normalize Beszel extra filesystem statistics."""
     normalized: dict[str, dict[str, Any]] = {}
@@ -157,6 +162,44 @@ def normalize_extra_filesystems(stats: dict[str, Any]) -> dict[str, dict[str, An
             "write": write,
         }
     return normalized
+
+
+def normalize_temperatures(stats: dict[str, Any]) -> dict[str, float]:
+    """Normalize the per-sensor temperatures reported by the Beszel agent."""
+    temperatures: dict[str, float] = {}
+    raw = stats.get("t")
+    if not isinstance(raw, dict):
+        return temperatures
+    for name, value in raw.items():
+        if not isinstance(name, str):
+            continue
+        number = _number(value)
+        if number is None:
+            continue
+        rounded = _rounded(number, 1)
+        if rounded is not None:
+            temperatures[name] = float(rounded)
+    return temperatures
+
+
+def normalize_system_status_counts(info: Any) -> dict[str, int | None]:
+    """Normalize optional service and package-update counts from Beszel."""
+    if not isinstance(info, dict):
+        info = {}
+
+    def count(field: str, index: int) -> int | None:
+        values = info.get(field)
+        if not isinstance(values, list) or len(values) <= index:
+            return None
+        value = values[index]
+        return value if type(value) is int and value >= 0 else None
+
+    return {
+        "services_total": count("sv", 0),
+        "services_failed": count("sv", 1),
+        "updates_total": count("pu", 0),
+        "updates_security": count("pu", 1),
+    }
 
 
 def normalize_system(
@@ -248,6 +291,7 @@ def normalize_system(
         "agent_version": info.get("v"),
         "metrics": metrics,
         "filesystems": normalize_extra_filesystems(stats),
+        "temperatures": normalize_temperatures(stats),
         "raw_info": info,
         "raw_stats": stats,
         "raw_details": details,
@@ -314,9 +358,7 @@ def normalize_containers(
     normalized: dict[str, dict[str, Any]] = {}
     seen: set[tuple[str, str]] = set()
 
-    for state in sorted(
-        current, key=lambda item: (str(item.get("name")), str(item.get("id")))
-    ):
+    for state in current:
         system_id = state.get("system")
         name = state.get("name")
         record_id = state.get("id")
@@ -332,12 +374,20 @@ def normalize_containers(
         raw = history.get((system_id, name), {})
         seen.add((system_id, name))
         identity = container_identity(system_id, name)
-        if identity in normalized:
-            # Two live containers share one name; the runtime ID separates them.
-            identity = f"{identity}-{record_id}"
-        normalized[identity] = _normalize_container(
+        record = _normalize_container(
             identity, record_id, system_id, name, system_names, state, raw
         )
+        # A recreate makes the Hub list the replaced container and its
+        # replacement together under one name. That is one logical container, so
+        # collapse them: keep the running record, then the freshest one. Letting
+        # the runtime container ID in would give the container a second identity,
+        # a second entity and a second device on every recreate.
+        previous = normalized.get(identity)
+        record_ids = previous["record_ids"] if previous else []
+        record_ids.append(record_id)
+        record["record_ids"] = record_ids
+        if previous is None or _container_rank(record) > _container_rank(previous):
+            normalized[identity] = record
 
     if not include_historical_only:
         return normalized

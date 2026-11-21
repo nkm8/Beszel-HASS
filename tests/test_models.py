@@ -32,6 +32,68 @@ class HostNormalizationTests(unittest.TestCase):
                 models.normalize_host(value)
 
 
+class SystemStatusCountTests(unittest.TestCase):
+    """Service and update counters must preserve missing and zero values."""
+
+    def test_all_values(self) -> None:
+        actual = models.normalize_system_status_counts({"sv": [7, 0], "pu": [116, 21]})
+        self.assertEqual(
+            actual,
+            {
+                "services_total": 7,
+                "services_failed": 0,
+                "updates_total": 116,
+                "updates_security": 21,
+            },
+        )
+
+    def test_zero_values(self) -> None:
+        result = models.normalize_system_status_counts({"sv": [0, 0], "pu": [0, 0]})
+        self.assertEqual(result["services_total"], 0)
+        self.assertEqual(result["updates_total"], 0)
+        self.assertEqual(result["updates_security"], 0)
+
+    def test_missing_updates(self) -> None:
+        result = models.normalize_system_status_counts({"sv": [47, 0]})
+        self.assertIsNone(result["updates_total"])
+        self.assertIsNone(result["updates_security"])
+
+    def test_partial_arrays(self) -> None:
+        result = models.normalize_system_status_counts({"sv": [3], "pu": [2]})
+        self.assertEqual(result["services_total"], 3)
+        self.assertIsNone(result["services_failed"])
+        self.assertEqual(result["updates_total"], 2)
+        self.assertIsNone(result["updates_security"])
+
+    def test_absent_info(self) -> None:
+        for info in (None, {}, []):
+            with self.subTest(info=info):
+                result = models.normalize_system_status_counts(info)
+                self.assertTrue(all(value is None for value in result.values()))
+
+    def test_invalid_container_types(self) -> None:
+        result = models.normalize_system_status_counts(
+            {"sv": "invalid", "pu": {"updates": 2}}
+        )
+        self.assertTrue(all(value is None for value in result.values()))
+
+    def test_negative_values(self) -> None:
+        result = models.normalize_system_status_counts({"sv": [-1, -2], "pu": [-3, -4]})
+        self.assertTrue(all(value is None for value in result.values()))
+
+    def test_boolean_values(self) -> None:
+        result = models.normalize_system_status_counts(
+            {"sv": [True, False], "pu": [True, False]}
+        )
+        self.assertTrue(all(value is None for value in result.values()))
+
+    def test_noninteger_values(self) -> None:
+        result = models.normalize_system_status_counts(
+            {"sv": ["3", 1.5], "pu": [None, "0"]}
+        )
+        self.assertTrue(all(value is None for value in result.values()))
+
+
 class SystemNormalizationTests(unittest.TestCase):
     """Current and legacy Beszel fields must yield identical native units."""
 
@@ -98,6 +160,30 @@ class SystemNormalizationTests(unittest.TestCase):
         self.assertEqual(metrics["network_received"], 3_670_016)
         self.assertEqual(metrics["disk_read"], 4_194_304)
         self.assertEqual(metrics["disk_write"], 5_242_880)
+
+    def test_per_sensor_temperatures_are_normalized(self) -> None:
+        system = {"id": "system123", "name": "pve1", "info": {"dt": 88.8}}
+        stats = {
+            "t": {
+                "k10temp_tctl": 87.13,
+                "nvme_composite": "44.85",
+                "zero": 0,
+                "broken": None,
+                "text": "n/a",
+                42: 12,
+            }
+        }
+        normalized = models.normalize_system(system, stats)
+        self.assertEqual(
+            normalized["temperatures"],
+            {"k10temp_tctl": 87.1, "nvme_composite": 44.9, "zero": 0.0},
+        )
+        # The aggregated dashboard sensor keeps its own value.
+        self.assertEqual(normalized["metrics"]["temperature"], 88.8)
+
+    def test_temperatures_default_to_empty_dict(self) -> None:
+        self.assertEqual(models.normalize_temperatures({}), {})
+        self.assertEqual(models.normalize_temperatures({"t": [1, 2]}), {})
 
     def test_omitted_zero_rates_remain_available(self) -> None:
         system = {"id": "system123", "info": {"bb": 0}}
@@ -188,18 +274,91 @@ class ContainerAndSmartNormalizationTests(unittest.TestCase):
             models.container_identity("sys-b", "app"),
         )
 
-    def test_two_live_containers_with_one_name_keep_both(self) -> None:
+    def test_recreate_reported_twice_collapses_to_one_container(self) -> None:
+        """The Hub lists a replaced container and its replacement under one name."""
         containers = models.normalize_containers(
             [
-                {"id": "aaa111", "system": "sys-a", "name": "app"},
-                {"id": "bbb222", "system": "sys-a", "name": "app"},
+                {  # the replaced container, still listed with its old uptime
+                    "id": "2f8fe5734408",
+                    "system": "sys-a",
+                    "name": "app",
+                    "status": "up 22 hours",
+                    "updated": "2026-11-07T17:04:53Z",
+                },
+                {  # its replacement, reported a minute later
+                    "id": "ee59508b07ea",
+                    "system": "sys-a",
+                    "name": "app",
+                    "status": "up 8 minutes",
+                    "updated": "2026-11-07T17:13:53Z",
+                },
             ],
             [],
             {"sys-a": "One"},
         )
-        self.assertEqual(len(containers), 2)
-        identity = models.container_identity("sys-a", "app")
-        self.assertEqual(sorted(containers), sorted([identity, f"{identity}-bbb222"]))
+
+        (identity,) = containers
+        self.assertEqual(identity, models.container_identity("sys-a", "app"))
+        # Neither runtime ID leaks into the identity, and the live record wins.
+        self.assertNotIn("ee59508b07ea", identity)
+        self.assertNotIn("2f8fe5734408", identity)
+        self.assertEqual(containers[identity]["id"], "ee59508b07ea")
+        self.assertEqual(
+            containers[identity]["record_ids"], ["2f8fe5734408", "ee59508b07ea"]
+        )
+        self.assertEqual(containers[identity]["status"], "up 8 minutes")
+
+    def test_a_running_record_outranks_a_stopped_one(self) -> None:
+        containers = models.normalize_containers(
+            [
+                {
+                    "id": "fresh-but-stopped",
+                    "system": "sys-a",
+                    "name": "app",
+                    "status": "exited",
+                    "updated": "2026-11-07T17:20:00Z",
+                },
+                {
+                    "id": "running",
+                    "system": "sys-a",
+                    "name": "app",
+                    "status": "up 3 days",
+                    "updated": "2026-11-07T17:00:00Z",
+                },
+            ],
+            [],
+            {"sys-a": "One"},
+        )
+
+        (identity,) = containers
+        self.assertEqual(containers[identity]["id"], "running")
+
+    def test_same_name_records_collapse_even_when_both_are_running(self) -> None:
+        """One name in one system is one container, whichever record is fresher."""
+        containers = models.normalize_containers(
+            [
+                {
+                    "id": "aaa111",
+                    "system": "sys-a",
+                    "name": "app",
+                    "status": "up 5 days",
+                    "updated": "2026-11-07T17:13:15Z",
+                },
+                {
+                    "id": "bbb222",
+                    "system": "sys-a",
+                    "name": "app",
+                    "status": "up 17 seconds",
+                    "updated": "2026-11-07T17:14:15Z",
+                },
+            ],
+            [],
+            {"sys-a": "One"},
+        )
+
+        (identity,) = containers
+        self.assertEqual(identity, models.container_identity("sys-a", "app"))
+        self.assertEqual(containers[identity]["id"], "bbb222")
 
     def test_legacy_container_gets_collision_resistant_id(self) -> None:
         containers = models.normalize_containers(

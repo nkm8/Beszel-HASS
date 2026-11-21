@@ -18,6 +18,7 @@ from .const import (
     EXTRA_DISK_SENSOR_DESCRIPTIONS,
     SMART_SENSOR_DESCRIPTIONS,
     SYSTEM_SENSOR_DESCRIPTIONS,
+    TEMPERATURE_SENSOR_DESCRIPTIONS,
 )
 from .coordinator import BeszelDataUpdateCoordinator
 
@@ -156,10 +157,10 @@ def container_identity_map(
     """
     identities: dict[str, str] = {}
     for identity, container in coordinator.containers.items():
-        record_id = container.get("id")
-        if not isinstance(record_id, str) or not record_id or record_id == identity:
-            continue
-        identities[f"container:{record_id}"] = f"container:{identity}"
+        for record_id in container.get("record_ids", (container.get("id"),)):
+            if not isinstance(record_id, str) or not record_id or record_id == identity:
+                continue
+            identities[f"container:{record_id}"] = f"container:{identity}"
     return identities
 
 
@@ -173,7 +174,8 @@ def async_migrate_legacy_entities(
 
     Container entities also move off the runtime container ID, which a recreate
     replaces, onto their stable identity, so a replaced container keeps its entity,
-    its device and its long-term statistics.
+    its device and its long-term statistics. Retain container entries with no
+    confirmed match in the first snapshot.
     """
     registry = er.async_get(hass)
     mappings: dict[str, str] = {}
@@ -275,6 +277,16 @@ def async_migrate_legacy_entities(
         expected.update(
             entity_unique_id(
                 coordinator,
+                "temperature",
+                f"{system_id}:{sensor_name}",
+                description.key,
+            )
+            for sensor_name in system.get("temperatures", {})
+            for description in TEMPERATURE_SENSOR_DESCRIPTIONS
+        )
+        expected.update(
+            entity_unique_id(
+                coordinator,
                 "filesystem",
                 f"{system_id}:{filesystem}",
                 description.key,
@@ -301,14 +313,14 @@ def async_migrate_legacy_entities(
             continue
         new_unique_id = mappings.get(entity.unique_id)
         namespace, separator, suffix = entity.unique_id.partition(":")
+        kind = suffix.partition(":")[0]
         if (
             new_unique_id is None
             and separator
             and namespace != coordinator.namespace
             and len(namespace) == 12
             and all(char in "0123456789abcdef" for char in namespace)
-            and suffix.split(":", 1)[0]
-            in {"system", "filesystem", "container", "smart"}
+            and kind in {"system", "filesystem", "container", "smart", "temperature"}
         ):
             candidate = f"{coordinator.namespace}:{suffix}"
             if candidate in expected:
@@ -321,7 +333,7 @@ def async_migrate_legacy_entities(
                 )
                 if replacement is not None and replacement in expected:
                     new_unique_id = replacement
-                else:
+                elif kind not in {"container", "temperature"}:
                     registry.async_remove(entity.entity_id)
                     continue
         if new_unique_id is None or new_unique_id == entity.unique_id:
@@ -330,7 +342,11 @@ def async_migrate_legacy_entities(
         existing = registry.async_get_entity_id(platform, DOMAIN, new_unique_id)
         if existing and existing != entity.entity_id:
             existing_entry = registry.async_get(existing)
-            if existing_entry and existing_entry.config_entry_id == entry.entry_id:
+            if (
+                existing_entry
+                and existing_entry.config_entry_id == entry.entry_id
+                and new_unique_id.split(":", 2)[1] != "container"
+            ):
                 registry.async_remove(entity.entity_id)
                 continue
             _LOGGER.warning(
@@ -345,29 +361,52 @@ def async_migrate_legacy_entities(
 @callback
 def async_migrate_container_devices(
     hass: HomeAssistant,
+    entry: ConfigEntry,
     coordinator: BeszelDataUpdateCoordinator,
 ) -> None:
     """Re-point container devices at their stable identity.
 
-    Registering the identity as a new identifier would otherwise create a second
-    device and drop the first one's area, name and labels.
+    The device is reached through the entity that already lives on it. Its stored
+    identifier holds the runtime container ID the Hub reported when the device was
+    created, which every later recreate replaces, so looking the device up by that
+    ID misses every container that has been replaced since. Registering the
+    identity as a new identifier instead would create a second device and drop the
+    first one's area, name and labels.
     """
+    entity_registry = er.async_get(hass)
     device_registry = dr.async_get(hass)
     identities = container_identity_map(coordinator)
     if not identities:
         return
-    for identity, container in coordinator.containers.items():
-        record_id = container.get("id")
-        if not isinstance(record_id, str) or not record_id or record_id == identity:
+
+    # Entity unique IDs were just migrated, so the prefix identifies the container.
+    wanted: dict[str, str] = {}
+    for segment in identities.values():
+        identity = segment.partition(":")[2]
+        wanted[f"{coordinator.namespace}:container:{identity}"] = identity
+    taken = {
+        identifier
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        for identifier in device.identifiers
+    }
+
+    for registry_entry in list(entity_registry.entities.values()):
+        if registry_entry.config_entry_id != entry.entry_id:
             continue
-        previous = device_identifier(coordinator, "container", record_id)
+        if not registry_entry.unique_id or not registry_entry.device_id:
+            continue
+        prefix, separator, _ = registry_entry.unique_id.rpartition(":")
+        identity = wanted.get(prefix) if separator else None
+        if identity is None:
+            continue
         stable = device_identifier(coordinator, "container", identity)
-        device = device_registry.async_get_device(identifiers={previous})
-        if device is None:
+        if stable in taken:
             continue
-        if device_registry.async_get_device(identifiers={stable}) is not None:
+        device = device_registry.async_get(registry_entry.device_id)
+        if device is None or device.identifiers == {stable}:
             continue
         device_registry.async_update_device(device.id, new_identifiers={stable})
+        taken.add(stable)
 
 
 @callback
